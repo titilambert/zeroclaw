@@ -45,6 +45,7 @@ pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
 pub mod security_headers;
+pub mod openai_channel;
 pub mod session_queue;
 pub mod sse;
 pub mod static_files;
@@ -2020,7 +2021,7 @@ pub async fn run_gateway(
     #[cfg(feature = "a2a")]
     let long_running_router = long_running_router.merge(a2a::a2a_task_route());
     let long_running_router: Router = long_running_router
-        .with_state(state)
+        .with_state(state.clone())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -2028,6 +2029,37 @@ pub async fn run_gateway(
         ));
 
     let inner = inner.merge(long_running_router);
+    // ── OpenAI bridge channel (opt-in via [channels.openai.<alias>] enabled = true) ──
+    let inner = if let Some(cfg) = config.channels.openai.values().find(|c| c.enabled) {
+        tracing::info!("OpenAI bridge enabled: /openai/v1/chat/completions, /openai/v1/models");
+        // Validate system_prompt_mode at startup to catch typos early.
+        const VALID_MODES: &[&str] = &["zeroclaw", "merge", "caller"];
+        if !VALID_MODES.contains(&cfg.system_prompt_mode.as_str()) {
+            tracing::warn!(
+                mode = %cfg.system_prompt_mode,
+                valid = ?VALID_MODES,
+                "channels.openai.<alias>.system_prompt_mode is invalid, falling back to 'zeroclaw'"
+            );
+        }
+        let openai_router = Router::new()
+            .route(
+                "/openai/v1/models",
+                get(openai_channel::handle_openai_models),
+            )
+            .route(
+                "/openai/v1/chat/completions",
+                post(openai_channel::handle_openai_chat_completion_stream),
+            )
+            .with_state(state.clone())
+            .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
+            ));
+        inner.merge(openai_router)
+    } else {
+        inner
+    };
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
