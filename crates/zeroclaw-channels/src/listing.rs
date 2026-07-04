@@ -204,7 +204,7 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-webhook"),
     },
     ChannelCompileSpec {
-        schema_name: Some("OpenAI"),
+        schema_name: Some("OpenAI Bridge"),
         type_keys: &["openai"],
         compiled: cfg!(feature = "channel-openai"),
     },

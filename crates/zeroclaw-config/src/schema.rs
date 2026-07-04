@@ -12883,8 +12883,8 @@ impl ChannelsConfig {
             },
             ChannelInfo {
                 kind: "openai",
-                name: "OpenAI",
-                desc: "OpenAI-compatible HTTP bridge (/openai/v1)",
+                name: "OpenAI Bridge",
+                desc: "OpenAI-compatible HTTP bridge (/openai/{alias}/v1)",
                 configured: !self.openai.is_empty(),
             },
         ]
@@ -13786,8 +13786,8 @@ impl ChannelConfig for WebhookConfig {
 /// in-memory default matches the on-disk parsed default. Mismatches cause
 /// spurious `compute_drift` hits for newly-created channel entries.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[display_name = "OpenAI"]
-#[description = "OpenAI-compatible HTTP endpoint (/openai/v1)"]
+#[display_name = "OpenAI Bridge"]
+#[description = "OpenAI-compatible HTTP endpoint (/openai/{alias}/v1)"]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.openai"]
 pub struct OpenaiChannelConfig {
