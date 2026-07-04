@@ -34221,8 +34221,7 @@ model_provider = \"ollama.default\"
             .find(|f| f.name == "channels.openai.default.system_prompt_mode")
             .expect("field must be present");
         assert_eq!(
-            field.display_value,
-            UNSET_DISPLAY,
+            field.display_value, UNSET_DISPLAY,
             "system_prompt_mode at default value must show UNSET_DISPLAY to avoid drift"
         );
 
@@ -34240,8 +34239,7 @@ model_provider = \"ollama.default\"
 
         // The skip_serializing_if predicate must prevent "zeroclaw" from
         // appearing in the TOML serialization.
-        let toml_str =
-            toml::to_string(&OpenaiChannelConfig::default()).expect("must serialize");
+        let toml_str = toml::to_string(&OpenaiChannelConfig::default()).expect("must serialize");
         assert!(
             !toml_str.contains("system_prompt_mode"),
             "default system_prompt_mode must not be written to TOML: {toml_str}"

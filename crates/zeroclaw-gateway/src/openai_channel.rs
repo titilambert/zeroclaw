@@ -317,27 +317,29 @@ pub async fn handle_openai_chat_completion_stream(
     )
     .await
     {
-            Ok(a) => a,
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": e.to_string(), "agent_alias": agent_alias})),
-                    "OpenAI bridge: agent init failed"
-                );
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": format!("Agent initialization failed: {e}"),
-                            "type": "server_error"
-                        }
-                    })),
-                )
-                    .into_response();
-            }
-        };
+        Ok(a) => a,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"error": e.to_string(), "agent_alias": agent_alias})
+                    ),
+                "OpenAI bridge: agent init failed"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Agent initialization failed: {e}"),
+                        "type": "server_error"
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
 
     if let Some(ref sid) = session_id {
         agent.set_memory_session_id(Some(sid.clone()));
