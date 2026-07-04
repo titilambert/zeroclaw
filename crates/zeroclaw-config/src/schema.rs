@@ -34227,8 +34227,10 @@ model_provider = \"ollama.default\"
 
         // Non-default value "merge" must be visible.
         let mut config2 = Config::default();
-        let mut entry = OpenaiChannelConfig::default();
-        entry.system_prompt_mode = "merge".to_string();
+        let entry = OpenaiChannelConfig {
+            system_prompt_mode: "merge".to_string(),
+            ..Default::default()
+        };
         config2.channels.openai.insert("default".to_string(), entry);
         let field2 = config2
             .prop_fields()
