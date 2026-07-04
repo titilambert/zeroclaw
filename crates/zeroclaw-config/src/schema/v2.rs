@@ -116,6 +116,7 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "mqtt",
     "amqp",
     "filesystem",
+    "openai",
 ];
 
 impl V2Config {
