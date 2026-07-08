@@ -12932,6 +12932,7 @@ impl ChannelsConfig {
             || self.amqp.values().any(|c| c.enabled)
             || self.filesystem.values().any(|c| c.enabled)
             || self.git.values().any(|c| c.enabled)
+            || self.openai.values().any(|c| c.enabled)
     }
 
     /// One `(canonical_name, configured, deliverable)` row per channel in the
@@ -12940,7 +12941,10 @@ impl ChannelsConfig {
     /// for input-only transports whose `Channel::send` is a no-op (mqtt and
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
-    /// instead of accepting a target the delivery layer silently drops.
+    /// instead of accepting a target the delivery layer silently drops. `openai`
+    /// has no `Channel::send` at all — it is a synchronous request/response HTTP
+    /// bridge, not a background listener with a push-capable session — so it is
+    /// non-deliverable for the same reason.
     pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
         [
             ("telegram", !self.telegram.is_empty(), true),
@@ -12979,6 +12983,7 @@ impl ChannelsConfig {
             ("mqtt", !self.mqtt.is_empty(), false),
             ("amqp", !self.amqp.is_empty(), false),
             ("filesystem", !self.filesystem.is_empty(), false),
+            ("openai", !self.openai.is_empty(), false),
         ]
     }
 
@@ -34025,7 +34030,14 @@ model_provider = \"ollama.default\"
         undeliverable.sort_unstable();
         assert_eq!(
             undeliverable,
-            ["amqp", "filesystem", "mqtt", "voice_duplex", "voice_wake"],
+            [
+                "amqp",
+                "filesystem",
+                "mqtt",
+                "openai",
+                "voice_duplex",
+                "voice_wake"
+            ],
             "only input-only transports may be non-deliverable; update channel_presence and is_channel_deliverable together"
         );
     }
