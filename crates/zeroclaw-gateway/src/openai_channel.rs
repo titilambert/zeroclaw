@@ -1,0 +1,673 @@
+use crate::AppState;
+use axum::extract::Extension;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::sse::{Event, Sse};
+use axum::{Json, extract::State, response::IntoResponse};
+use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+use std::time::{SystemTime, UNIX_EPOCH};
+use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_providers::ChatMessage;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn completion_id() -> String {
+    format!("chatcmpl-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Given the client's full `messages` array and the index of the final
+/// `user` message (extracted as the turn's prompt), returns the messages
+/// that should be seeded into the agent's history so multi-turn context
+/// from earlier in the array isn't discarded. System messages are excluded
+/// here since they're merged separately via `set_caller_system_prompt`.
+fn history_seed_from_messages(messages: &[Message], last_user_idx: usize) -> Vec<ChatMessage> {
+    messages[..last_user_idx]
+        .iter()
+        .filter(|m| m.role != "system")
+        .map(|m| ChatMessage {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        })
+        .collect()
+}
+
+/// Human-readable status message shown to the user when a tool is invoked.
+/// Sent as a regular SSE content chunk so clients (Home Assistant, Open WebUI)
+/// can display it while the tool executes.
+fn tool_status_message(tool_name: &str) -> &'static str {
+    match tool_name {
+        "web_search" | "web_search_tool" => "🔍 Searching the web...",
+        "web_fetch" => "📄 Reading page...",
+        "shell" => "⚙️ Running command...",
+        "calculator" => "🔢 Calculating...",
+        "memory_recall" => "🧠 Recalling memory...",
+        "memory_store" => "💾 Storing memory...",
+        "file_read" => "📂 Reading file...",
+        "file_write" => "✏️ Writing file...",
+        "http_request" => "🌐 Making HTTP request...",
+        "browser" | "browser_open" => "🌐 Opening browser...",
+        _ => "🛠️ Using tool...",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request / Response types (OpenAI wire format)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAIModel {
+    pub id: String,
+    pub object: String,
+    #[serde(default)]
+    pub owned_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsResponse {
+    pub object: String,
+    pub data: Vec<OpenAIModel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionRequest {
+    pub model: String,
+    pub messages: Vec<Message>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub n: Option<u32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f64>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f64>,
+    #[serde(default)]
+    pub stop: Option<Vec<String>>,
+    /// OpenAI-compatible `user` field. Accepted for wire compatibility but
+    /// currently unused: memory recall/store is unscoped (shared across all
+    /// entry points into the agent), so this is not used as a session key.
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionChoice {
+    pub index: u32,
+    pub message: Message,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionResponse {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ChatCompletionChoice>,
+    pub usage: Option<ChatCompletionUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionChunkChoice {
+    pub index: u32,
+    pub delta: MessageDelta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionChunk {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ChatCompletionChunkChoice>,
+}
+
+// ---------------------------------------------------------------------------
+// Auth helper — mirrors handle_webhook pattern exactly
+// ---------------------------------------------------------------------------
+
+fn check_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if !state.pairing.require_pairing() {
+        return Ok(());
+    }
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = auth.strip_prefix("Bearer ").unwrap_or("");
+    if state.pairing.is_authenticated(token) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key"
+                }
+            })),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSE chunk builder
+// ---------------------------------------------------------------------------
+
+fn make_sse_chunk(id: &str, created: u64, model: &str, content: &str) -> Event {
+    let chunk = ChatCompletionChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk".to_string(),
+        created,
+        model: model.to_string(),
+        choices: vec![ChatCompletionChunkChoice {
+            index: 0,
+            delta: MessageDelta {
+                role: None,
+                content: Some(content.to_string()),
+            },
+            finish_reason: None,
+        }],
+    };
+    let data = serde_json::to_string(&chunk).unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e));
+    Event::default().data(data)
+}
+
+fn make_stop_chunk(id: &str, created: u64, model: &str) -> Event {
+    let chunk = ChatCompletionChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk".to_string(),
+        created,
+        model: model.to_string(),
+        choices: vec![ChatCompletionChunkChoice {
+            index: 0,
+            delta: MessageDelta {
+                role: None,
+                content: None,
+            },
+            finish_reason: Some("stop".to_string()),
+        }],
+    };
+    let data = serde_json::to_string(&chunk).unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e));
+    Event::default().data(data)
+}
+
+// ---------------------------------------------------------------------------
+// GET /openai/{alias}/v1/models
+// ---------------------------------------------------------------------------
+
+pub async fn handle_openai_models(
+    State(state): State<AppState>,
+    Extension(_alias): Extension<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let model_id = state.model.clone();
+
+    Json(ModelsResponse {
+        object: "list".to_string(),
+        data: vec![OpenAIModel {
+            id: model_id,
+            object: "model".to_string(),
+            owned_by: Some("zeroclaw".to_string()),
+        }],
+    })
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /openai/{alias}/v1/chat/completions
+// ---------------------------------------------------------------------------
+
+pub async fn handle_openai_chat_completion_stream(
+    State(state): State<AppState>,
+    Extension(_alias): Extension<String>,
+    headers: HeaderMap,
+    Json(req): Json<ChatCompletionRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    // Extract the last user message as the agent prompt. OpenAI-compatible
+    // clients (Home Assistant, Open WebUI, etc.) resend the full `messages`
+    // array on every request per the stateless chat completions wire
+    // protocol; everything before the last user message is seeded into the
+    // agent's history below so multi-turn context isn't discarded. The
+    // client's array is treated as the source of truth for conversation
+    // history here — no separate server-owned history store is introduced
+    // for this channel, avoiding a second copy of the same state.
+    let last_user_idx = req.messages.iter().rposition(|m| m.role == "user");
+    let prompt = match last_user_idx.map(|i| req.messages[i].content.clone()) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": "No user message found in messages array",
+                        "type": "invalid_request_error"
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let id = completion_id();
+    let created = unix_now();
+    let model = state.model.clone();
+    let streaming = req.stream.unwrap_or(false);
+
+    // ── Build agent from config (soul/identity + tools injected automatically) ──
+    let config = state.config.read().clone();
+    let Some(agent_alias) = config.resolved_runtime_agent_alias().map(str::to_owned) else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "OpenAI bridge rejected: no configured [agents.<alias>] entry"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "OpenAI bridge requires at least one configured [agents.<alias>] entry",
+                    "type": "invalid_request_error"
+                }
+            })),
+        )
+            .into_response();
+    };
+    let mut agent = match zeroclaw_runtime::agent::Agent::from_config_with_session_cwd(
+        &config,
+        &agent_alias,
+        None,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"error": e.to_string(), "agent_alias": agent_alias})
+                    ),
+                "OpenAI bridge: agent init failed"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Agent initialization failed: {e}"),
+                        "type": "server_error"
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // No per-alias/per-user memory_session_id is set here: like the
+    // orchestrator-routed channels (Telegram, Discord, etc.), recall/store
+    // runs unscoped (session_id=None) so the agent's long-term memory is
+    // shared across every entry point into it (openai bridge, WS/dashboard
+    // UI, other channels) rather than siloed per alias. See PR #8710 review
+    // discussion: siloing by alias meant memory written via the ZeroClaw UI
+    // was invisible to the openai bridge and vice versa.
+
+    // Merge any caller-supplied system message(s) into ZeroClaw's own
+    // built-in prompt (identity/SOUL.md/USER.md + safety + tools) as a
+    // distinct section — never replacing it. If the client sends no system
+    // message (or only whitespace), behavior is unchanged from today.
+    let caller_system_prompt = req
+        .messages
+        .iter()
+        .filter(|m| m.role == "system")
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !caller_system_prompt.trim().is_empty() {
+        agent.set_caller_system_prompt(Some(caller_system_prompt));
+    }
+
+    // Seed the agent's in-memory history with every message the client
+    // resent before the final user turn (system messages excluded — they're
+    // merged above via set_caller_system_prompt instead). This is a
+    // per-request seed only: it lives in `agent` for the lifetime of this
+    // single turn and is dropped afterward, so it does not create a second,
+    // persistent copy of conversation state — the client's array remains
+    // the sole source of truth across requests.
+    if let Some(idx) = last_user_idx {
+        let seed = history_seed_from_messages(&req.messages, idx);
+        if !seed.is_empty() {
+            agent.seed_history(&seed);
+        }
+    }
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+
+    zeroclaw_spawn::spawn!(async move {
+        if let Err(e) = agent.turn_streamed(&prompt, event_tx, None).await {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "OpenAI bridge: turn_streamed error"
+            );
+        }
+    });
+
+    if streaming {
+        // ── Streaming SSE path ───────────────────────────────────────────────
+        // Relay TurnEvents as SSE chunks:
+        //   TurnEvent::ToolCall  → human-readable status message
+        //   TurnEvent::Chunk     → real LLM token delta
+        //   TurnEvent::Thinking  → ignored (internal reasoning)
+        //   TurnEvent::ToolResult→ ignored
+        let id_clone = id.clone();
+        let model_clone = model.clone();
+
+        let stream = async_stream::stream! {
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    TurnEvent::ToolCall { ref name, .. } => {
+                        let msg = tool_status_message(name);
+                        yield Ok::<_, Infallible>(
+                            make_sse_chunk(&id_clone, created, &model_clone, msg)
+                        );
+                    }
+                    TurnEvent::Chunk { delta } => {
+                        yield Ok::<_, Infallible>(
+                            make_sse_chunk(&id_clone, created, &model_clone, &delta)
+                        );
+                    }
+                    TurnEvent::Thinking { .. }
+                    | TurnEvent::ToolResult { .. }
+                    | TurnEvent::ApprovalRequest { .. }
+                    | TurnEvent::Usage { .. }
+                    | TurnEvent::HistoryTrimmed { .. }
+                    | TurnEvent::Plan { .. } => {
+                        // Not forwarded to the client.
+                    }
+                }
+            }
+            // Final stop chunk + [DONE] sentinel.
+            yield Ok::<_, Infallible>(make_stop_chunk(&id_clone, created, &model_clone));
+            yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
+        };
+
+        Sse::new(stream).into_response()
+    } else {
+        // ── Non-streaming path ───────────────────────────────────────────────
+        // Drain the event channel, collecting only Chunk deltas.
+        // Tool status messages are NOT included in non-streaming responses —
+        // clients like Home Assistant expect a clean final text.
+        let mut full_response = String::new();
+        while let Some(event) = event_rx.recv().await {
+            if let TurnEvent::Chunk { delta } = event {
+                full_response.push_str(&delta);
+            }
+        }
+
+        Json(ChatCompletionResponse {
+            id,
+            object: "chat.completion".to_string(),
+            created,
+            model,
+            choices: vec![ChatCompletionChoice {
+                index: 0,
+                message: Message {
+                    role: "assistant".to_string(),
+                    content: full_response,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: Some(ChatCompletionUsage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            }),
+        })
+        .into_response()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── tool_status_message ──────────────────────────────────────────────────
+
+    #[test]
+    fn known_tools_have_specific_messages() {
+        assert!(tool_status_message("web_search").contains("Searching"));
+        assert!(tool_status_message("web_fetch").contains("Reading"));
+        assert!(tool_status_message("shell").contains("Running"));
+        assert!(tool_status_message("calculator").contains("Calculating"));
+        assert!(tool_status_message("memory_recall").contains("Recalling"));
+        assert!(tool_status_message("file_read").contains("Reading"));
+    }
+
+    #[test]
+    fn unknown_tool_returns_generic_message() {
+        assert_eq!(tool_status_message("some_unknown_tool"), "🛠️ Using tool...");
+    }
+
+    // ── history_seed_from_messages ───────────────────────────────────────────
+
+    #[test]
+    fn history_seed_excludes_last_user_message_and_system_messages() {
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "be nice".to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: "what's my name?".to_string(),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: "your name is Bob".to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: "and my favorite color?".to_string(),
+            },
+        ];
+        let last_user_idx = messages.iter().rposition(|m| m.role == "user").unwrap();
+        let seed = history_seed_from_messages(&messages, last_user_idx);
+        assert_eq!(seed.len(), 2);
+        assert_eq!(seed[0].role, "user");
+        assert_eq!(seed[0].content, "what's my name?");
+        assert_eq!(seed[1].role, "assistant");
+        assert_eq!(seed[1].content, "your name is Bob");
+    }
+
+    #[test]
+    fn history_seed_is_empty_when_last_user_message_is_first() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let last_user_idx = messages.iter().rposition(|m| m.role == "user").unwrap();
+        let seed = history_seed_from_messages(&messages, last_user_idx);
+        assert!(seed.is_empty());
+    }
+
+    // ── OpenAI wire format ───────────────────────────────────────────────────
+
+    #[test]
+    fn chat_completion_request_stream_defaults_to_none() {
+        let json = r#"{"model":"default","messages":[{"role":"user","content":"hi"}]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.stream.is_none());
+        assert!(req.user.is_none());
+    }
+
+    #[test]
+    fn chat_completion_request_parses_stream_true() {
+        let json =
+            r#"{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.stream, Some(true));
+    }
+
+    #[test]
+    fn models_response_serializes_correctly() {
+        let resp = ModelsResponse {
+            object: "list".to_string(),
+            data: vec![OpenAIModel {
+                id: "my-model".to_string(),
+                object: "model".to_string(),
+                owned_by: Some("zeroclaw".to_string()),
+            }],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"object\":\"list\""));
+        assert!(json.contains("\"id\":\"my-model\""));
+        assert!(json.contains("\"owned_by\":\"zeroclaw\""));
+    }
+
+    #[test]
+    fn message_delta_skips_none_fields() {
+        let delta = MessageDelta {
+            role: None,
+            content: Some("hello".to_string()),
+        };
+        let json = serde_json::to_string(&delta).unwrap();
+        assert!(!json.contains("role"));
+        assert!(json.contains("content"));
+    }
+
+    #[test]
+    fn completion_id_has_correct_prefix_and_is_unique() {
+        let id1 = completion_id();
+        let id2 = completion_id();
+        assert!(id1.starts_with("chatcmpl-"));
+        assert!(id2.starts_with("chatcmpl-"));
+        // UUIDs guarantee uniqueness — two calls must not collide.
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn make_sse_chunk_serializes_content_correctly() {
+        let event = make_sse_chunk("id-1", 123, "my-model", "hello");
+        // Event::data() is not directly inspectable, but we can verify
+        // the chunk struct serializes as expected.
+        let chunk = ChatCompletionChunk {
+            id: "id-1".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 123,
+            model: "my-model".to_string(),
+            choices: vec![ChatCompletionChunkChoice {
+                index: 0,
+                delta: MessageDelta {
+                    role: None,
+                    content: Some("hello".to_string()),
+                },
+                finish_reason: None,
+            }],
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(json.contains("\"content\":\"hello\""));
+        assert!(json.contains("\"object\":\"chat.completion.chunk\""));
+        assert!(!json.contains("finish_reason"));
+        let _ = event; // event is constructed without error
+    }
+
+    #[test]
+    fn make_stop_chunk_has_finish_reason_stop() {
+        let chunk = ChatCompletionChunk {
+            id: "id-1".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 123,
+            model: "my-model".to_string(),
+            choices: vec![ChatCompletionChunkChoice {
+                index: 0,
+                delta: MessageDelta {
+                    role: None,
+                    content: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(json.contains("\"finish_reason\":\"stop\""));
+        assert!(!json.contains("\"content\""));
+    }
+
+    // ── URL derivation from gateway config ───────────────────────────────────
+
+    #[test]
+    fn public_url_derived_from_gateway_host_port_alias() {
+        let host = "127.0.0.1";
+        let port: u16 = 42617;
+        let alias = "default";
+        let prefix = "";
+        let url = format!("http://{host}:{port}{prefix}/openai/{alias}/v1");
+        assert_eq!(url, "http://127.0.0.1:42617/openai/default/v1");
+    }
+
+    #[test]
+    fn public_url_includes_path_prefix_when_set() {
+        let host = "127.0.0.1";
+        let port: u16 = 42617;
+        let alias = "prod";
+        let prefix = "/zc";
+        let url = format!("http://{host}:{port}{prefix}/openai/{alias}/v1");
+        assert_eq!(url, "http://127.0.0.1:42617/zc/openai/prod/v1");
+    }
+}

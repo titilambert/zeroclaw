@@ -12486,6 +12486,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub webhook: HashMap<String, WebhookConfig>,
+    /// OpenAI-compatible bridge channel instances (`[channels.openai.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub openai: HashMap<String, OpenaiChannelConfig>,
     /// iMessage channel instances (`[channels.imessage.<alias>]`, macOS only).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -12877,6 +12881,12 @@ impl ChannelsConfig {
                 desc: "HTTP endpoint",
                 configured: !self.webhook.is_empty(),
             },
+            ChannelInfo {
+                kind: "openai",
+                name: "OpenAI Bridge",
+                desc: "OpenAI-compatible HTTP bridge (/openai/{alias}/v1)",
+                configured: !self.openai.is_empty(),
+            },
         ]
     }
 
@@ -12922,6 +12932,7 @@ impl ChannelsConfig {
             || self.amqp.values().any(|c| c.enabled)
             || self.filesystem.values().any(|c| c.enabled)
             || self.git.values().any(|c| c.enabled)
+            || self.openai.values().any(|c| c.enabled)
     }
 
     /// One `(canonical_name, configured, deliverable)` row per channel in the
@@ -12930,8 +12941,11 @@ impl ChannelsConfig {
     /// for input-only transports whose `Channel::send` is a no-op (mqtt and
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
-    /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    /// instead of accepting a target the delivery layer silently drops. `openai`
+    /// has no `Channel::send` at all — it is a synchronous request/response HTTP
+    /// bridge, not a background listener with a push-capable session — so it is
+    /// non-deliverable for the same reason.
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 37] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -12969,6 +12983,7 @@ impl ChannelsConfig {
             ("mqtt", !self.mqtt.is_empty(), false),
             ("amqp", !self.amqp.is_empty(), false),
             ("filesystem", !self.filesystem.is_empty(), false),
+            ("openai", !self.openai.is_empty(), false),
         ]
     }
 
@@ -13024,6 +13039,7 @@ impl Default for ChannelsConfig {
             slack: HashMap::new(),
             mattermost: HashMap::new(),
             webhook: HashMap::new(),
+            openai: HashMap::new(),
             imessage: HashMap::new(),
             matrix: HashMap::new(),
             signal: HashMap::new(),
@@ -13764,6 +13780,27 @@ impl ChannelConfig for WebhookConfig {
     }
     fn desc() -> &'static str {
         "HTTP endpoint"
+    }
+}
+
+/// OpenAI-compatible bridge channel configuration (`[channels.openai.<alias>]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[display_name = "OpenAI Bridge"]
+#[description = "OpenAI-compatible HTTP endpoint (/openai/{alias}/v1)"]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.openai"]
+pub struct OpenaiChannelConfig {
+    /// Whether this channel is active. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl ChannelConfig for OpenaiChannelConfig {
+    fn name() -> &'static str {
+        "OpenAI Channel"
+    }
+    fn desc() -> &'static str {
+        "OpenAI-compatible HTTP endpoint (/openai/v1)"
     }
 }
 
@@ -23650,6 +23687,7 @@ auto_save = true
                 slack: HashMap::new(),
                 mattermost: HashMap::new(),
                 webhook: HashMap::new(),
+                openai: HashMap::new(),
                 imessage: HashMap::new(),
                 matrix: HashMap::new(),
                 signal: HashMap::new(),
@@ -25203,6 +25241,7 @@ allowed_users = ["@u:matrix.org"]
             slack: HashMap::new(),
             mattermost: HashMap::new(),
             webhook: HashMap::new(),
+            openai: HashMap::new(),
             imessage: HashMap::from([(
                 "default".to_string(),
                 IMessageConfig {
@@ -25728,6 +25767,7 @@ allowed_numbers = ["+1", "+2"]
             slack: HashMap::new(),
             mattermost: HashMap::new(),
             webhook: HashMap::new(),
+            openai: HashMap::new(),
             imessage: HashMap::new(),
             matrix: HashMap::new(),
             signal: HashMap::new(),
@@ -33948,7 +33988,14 @@ model_provider = \"ollama.default\"
         undeliverable.sort_unstable();
         assert_eq!(
             undeliverable,
-            ["amqp", "filesystem", "mqtt", "voice_duplex", "voice_wake"],
+            [
+                "amqp",
+                "filesystem",
+                "mqtt",
+                "openai",
+                "voice_duplex",
+                "voice_wake"
+            ],
             "only input-only transports may be non-deliverable; update channel_presence and is_channel_deliverable together"
         );
     }

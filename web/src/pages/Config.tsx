@@ -54,6 +54,7 @@ import CostRatesEditor, {
 } from "../components/sections/CostRatesEditor";
 import { Badge, Button, Card, PageHeader } from "@/components/ui";
 import { t } from "@/lib/i18n";
+import { basePath } from "@/lib/basePath";
 
 // Display order for the curated sidebar groups. Each `SectionInfo.group`
 // from the gateway lands in one of these buckets (anything else falls
@@ -885,6 +886,11 @@ function AliasListView({
               key={alias}
               alias={alias}
               mapPath={mapPath}
+              subtitle={
+                sectionKey === "channels" && typeKey === "openai"
+                  ? `${window.location.origin}${basePath}/openai/${alias}/v1`
+                  : undefined
+              }
               onSelect={() =>
                 onSelectAlias(alias).catch((e) => {
                   setError(
@@ -1309,6 +1315,7 @@ function parseAgentsList(raw: unknown): string[] {
 function AliasRow({
   alias,
   mapPath,
+  subtitle,
   onSelect,
   onDeleted,
   onDeleteError,
@@ -1316,6 +1323,9 @@ function AliasRow({
 }: {
   alias: string;
   mapPath: string;
+  /** Optional line shown below the config path — used e.g. to display the
+   *  live endpoint URL for OpenAI bridge channels. */
+  subtitle?: string;
   onSelect: () => void;
   onDeleted: () => void;
   onDeleteError: (msg: string) => void;
@@ -1485,6 +1495,11 @@ function AliasRow({
           <code className="block text-xs mt-0.5 text-pc-text-faint">
             {mapPath}.{alias}
           </code>
+          {subtitle && (
+            <span className="block text-xs mt-0.5 text-pc-text-muted font-mono truncate">
+              {subtitle}
+            </span>
+          )}
         </div>
         <ChevronRight className="h-4 w-4 flex-shrink-0 text-pc-text-muted" />
       </button>
