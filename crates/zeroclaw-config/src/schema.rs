@@ -12945,7 +12945,7 @@ impl ChannelsConfig {
     /// has no `Channel::send` at all — it is a synchronous request/response HTTP
     /// bridge, not a background listener with a push-capable session — so it is
     /// non-deliverable for the same reason.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 37] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),

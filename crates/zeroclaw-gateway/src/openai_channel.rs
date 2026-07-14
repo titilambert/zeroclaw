@@ -433,7 +433,8 @@ pub async fn handle_openai_chat_completion_stream(
                     | TurnEvent::ToolResult { .. }
                     | TurnEvent::ApprovalRequest { .. }
                     | TurnEvent::Usage { .. }
-                    | TurnEvent::HistoryTrimmed { .. } => {
+                    | TurnEvent::HistoryTrimmed { .. }
+                    | TurnEvent::Plan { .. } => {
                         // Not forwarded to the client.
                     }
                 }
